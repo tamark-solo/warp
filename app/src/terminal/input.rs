@@ -198,7 +198,7 @@ use crate::ai::execution_profiles::profiles::AIExecutionProfilesModel;
 use crate::ai::harness_availability::{
     CloudAgentStartBlocker, HarnessAvailabilityModel, cloud_agent_start_blocker,
 };
-use crate::ai::llms::{LLMPreferences, LLMPreferencesEvent};
+use crate::ai::llms::{LLMPreferences, LLMPreferencesEvent, byo_key_source_for_model};
 use crate::ai::mcp::TemplatableMCPServerManager;
 use crate::ai::predict::next_command_model::{
     NextCommandModel, NextCommandModelEvent, NextCommandSuggestionState, ZeroStateSuggestionInfo,
@@ -4435,6 +4435,18 @@ impl Input {
         ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
             toast_stack.add_ephemeral_toast(
                 DismissibleToast::error(message.to_string()),
+                window_id,
+                ctx,
+            );
+        });
+    }
+
+    /// Shows a transient informational toast for input that was captured rather than sent.
+    fn show_ephemeral_info_toast(&self, message: &str, ctx: &mut ViewContext<Self>) {
+        let window_id = ctx.window_id();
+        ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
+            toast_stack.add_ephemeral_toast(
+                DismissibleToast::default(message.to_string()),
                 window_id,
                 ctx,
             );
@@ -13991,29 +14003,35 @@ impl Input {
             .as_ref()
             .is_some_and(|panel| panel.as_ref(ctx).enter_sends_queued_prompt(ctx))
         {
-            // An empty-buffer Enter sends the top queued row, mirroring its send-now button.
-            // The locked initial cloud-mode head row is not sendable, so Enter does nothing
-            // while it sits at the head of the queue.
             let conversation_id =
                 BlocklistAIHistoryModel::as_ref(ctx).active_conversation_id(self.terminal_view_id);
-            let top_row = conversation_id.and_then(|conversation_id| {
-                QueuedQueryModel::as_ref(ctx)
+            if let Some(conversation_id) = conversation_id {
+                let top_row = QueuedQueryModel::as_ref(ctx)
                     .queue(conversation_id)
                     .first()
                     .filter(|row| !row.is_locked())
-                    .map(|row| (row.id(), row.text().to_owned(), row.is_command()))
-            });
-            if let (Some(conversation_id), Some((query_id, text, is_command))) =
-                (conversation_id, top_row)
-            {
-                self.send_queued_row_immediately(
-                    conversation_id,
-                    query_id,
-                    text,
-                    is_command,
-                    QueuedPromptSendNowTrigger::EnterOnEmptyInput,
-                    ctx,
-                );
+                    .map(|row| (row.id(), row.text().to_owned(), row.is_command()));
+                match top_row {
+                    Some((query_id, text, is_command)) => {
+                        self.send_queued_row_immediately(
+                            conversation_id,
+                            query_id,
+                            text,
+                            is_command,
+                            QueuedPromptSendNowTrigger::EnterOnEmptyInput,
+                            ctx,
+                        );
+                    }
+                    None => {
+                        log::info!(
+                            "event=input_enter_route route=queued_head_locked conversation_id={conversation_id}"
+                        );
+                        self.show_ephemeral_info_toast(
+                            "The next queued prompt is still being prepared and can't be sent yet.",
+                            ctx,
+                        );
+                    }
+                }
             }
             return;
         } else if self.maybe_launch_cloud_handoff_request(ctx)
@@ -14048,12 +14066,14 @@ impl Input {
         {
             // During cloud-mode setup, non-queued submissions (e.g. third-party harness runs that
             // don't queue) are dropped rather than sent as live prompts the sharer can't accept.
+            log::info!("event=input_enter_route route=cloud_agent_pre_first_exchange");
             return;
         } else if FeatureFlag::AgentMode.is_enabled()
             && AISettings::as_ref(ctx).is_any_ai_enabled(ctx)
             && (self.ai_input_model.as_ref(ctx).is_ai_input_enabled()
                 || self.is_cloud_mode_input_v2_composing(ctx))
         {
+            log::info!("event=input_enter_route route=ai_submit");
             // Check if we're configuring an ambient agent and spawn it instead of submitting a regular AI query.
             if self
                 .ambient_agent_view_model()
@@ -14131,6 +14151,10 @@ impl Input {
 
             self.submit_ai_query_with_routing(None, ctx);
         } else {
+            log::info!(
+                "event=input_enter_route route=shell_exec buffer_len={}",
+                command.trim().len()
+            );
             if FeatureFlag::WorkflowAliases.is_enabled() {
                 let mut command_string = self.editor.as_ref(ctx).buffer_text(ctx);
                 // If the alias was inserted from the completions menu, it will have trailing
@@ -14807,6 +14831,24 @@ impl Input {
         QueuedQueryModel::handle(ctx)
             .update(ctx, |model, ctx| model.append(conversation_id, query, ctx));
 
+        let lrc_queue_active = queued_for_lrc || queued_for_pending_lrc;
+        if lrc_queue_active || queue_for_summarize {
+            let reason = if lrc_queue_active {
+                "agent_command"
+            } else {
+                "summarizing"
+            };
+            log::info!(
+                "event=prompt_queued reason={reason} is_command={is_command} conversation_id={conversation_id}"
+            );
+            let message = match (is_command, lrc_queue_active) {
+                (true, _) => "Command queued — it will run when the current turn finishes.",
+                (false, true) => "Prompt queued — it will send when the agent's command finishes.",
+                (false, false) => "Prompt queued — it will send when summarizing finishes.",
+            };
+            self.show_ephemeral_info_toast(message, ctx);
+        }
+
         true
     }
 
@@ -14931,9 +14973,24 @@ impl Input {
         let alert_blocks_ai = {
             let user_workspaces = UserWorkspaces::as_ref(ctx);
             let scope = user_workspaces.team_context_for_view(ctx);
-            PromptAlertView::does_alert_block_ai_requests(&scope, ctx)
+            let alert_is_active = PromptAlertView::does_alert_block_ai_requests(&scope, ctx);
+            // An account-level alert (e.g. out of credits) must not block submissions that route
+            // inference through user-provided credentials, since those never consume Warp credits.
+            let uses_own_credentials = alert_is_active && {
+                let active_model = LLMPreferences::as_ref(ctx).get_active_base_model(
+                    &scope,
+                    ctx,
+                    Some(self.terminal_view_id),
+                );
+                byo_key_source_for_model(active_model, &scope, ctx).is_some()
+            };
+            if uses_own_credentials {
+                log::info!("event=input_enter_route route=account_alert_bypassed_byo");
+            }
+            alert_is_active && !uses_own_credentials
         };
         if alert_blocks_ai {
+            log::info!("event=input_enter_route route=blocked_by_account_alert");
             AIRequestUsageModel::handle(ctx).update(ctx, |usage_model, ctx| {
                 // Rate limit requests to fetch the user's AI usage if triggered by enter
                 // keypress.

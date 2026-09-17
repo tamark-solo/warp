@@ -996,6 +996,10 @@ pub enum FeatureFlag {
     /// replace inline computer-use screenshot bytes with references to
     /// Warp-managed object storage.
     StoredScreenshots,
+
+    /// Serves Agent Predict surfaces (next-command autofill) from the user's own custom inference
+    /// endpoint, called directly by the client, instead of Warp-hosted models on the Warp server.
+    LocalByoInference,
 }
 
 static FLAG_STATES: [AtomicBool; cardinality::<FeatureFlag>()] =
@@ -1095,7 +1099,10 @@ pub const RELEASE_FLAGS: &[FeatureFlag] = &[
 ];
 
 /// Flags that we want to allow to switch at runtime (assuming RuntimeFeatureFlags is set)
-pub const RUNTIME_FEATURE_FLAGS: &[FeatureFlag] = &[FeatureFlag::LocalClaudeCodexChildHarnesses];
+pub const RUNTIME_FEATURE_FLAGS: &[FeatureFlag] = &[
+    FeatureFlag::LocalClaudeCodexChildHarnesses,
+    FeatureFlag::LocalByoInference,
+];
 
 impl FeatureFlag {
     pub fn is_enabled(&self) -> bool {

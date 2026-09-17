@@ -379,6 +379,13 @@ impl NextCommandModel {
         let cached_next_command_context = self.cached_zerostate_next_command_context.clone();
         let team_scope =
             RequestTeamScope::from_scope(&self.ai_controller.as_ref(ctx).team_context(ctx));
+        let byo_autofill = crate::ai::predict::byo_next_command::request_timeout(
+            AISettings::as_ref(ctx).byo_autofill_wait,
+        )
+        .and_then(|timeout| {
+            let scope = self.ai_controller.as_ref(ctx).team_context(ctx);
+            crate::ai::byo_inference::resolve(ctx, &scope).map(|endpoint| (endpoint, timeout))
+        });
 
         let completion_context = completer_data.completion_session_context(ctx);
         // This is only needed if we have a prefix.
@@ -499,10 +506,21 @@ impl NextCommandModel {
 
                     // For zero-state next command suggestions, return the result immediately.
                     let Some(prefix) = prefix else {
+                        let response = match byo_autofill.as_ref() {
+                            Some((endpoint, timeout)) => {
+                                crate::ai::predict::byo_next_command::generate_suggestions(
+                                    endpoint, &request, *timeout,
+                                )
+                                .await
+                            }
+                            None => {
+                                server_api
+                                    .generate_ai_input_suggestions(&request, team_scope)
+                                    .await
+                            }
+                        };
                         return (
-                            server_api
-                                .generate_ai_input_suggestions(&request, team_scope)
-                                .await,
+                            response,
                             request,
                             true,
                             start_ts_ms,
@@ -582,9 +600,19 @@ impl NextCommandModel {
                     };
 
                     // Only if we have no commands from history and no completions, use the LLM to generate a partial suggestion.
-                    let response = server_api
-                        .generate_ai_input_suggestions(&request, team_scope)
-                        .await;
+                    let response = match byo_autofill.as_ref() {
+                        Some((endpoint, timeout)) => {
+                            crate::ai::predict::byo_next_command::generate_suggestions(
+                                endpoint, &request, *timeout,
+                            )
+                            .await
+                        }
+                        None => {
+                            server_api
+                                .generate_ai_input_suggestions(&request, team_scope)
+                                .await
+                        }
+                    };
                     (
                         response,
                         request,

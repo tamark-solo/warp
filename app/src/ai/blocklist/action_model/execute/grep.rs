@@ -31,7 +31,9 @@ use crate::terminal::shell::ShellType;
 use crate::workspaces::user_workspaces::TeamContext;
 use crate::{PrivacySettings, TelemetryEvent, send_telemetry_from_app_ctx};
 
-const GREP_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bound on a runaway search. Searching a checkout on a synced or networked filesystem can take
+/// far longer than a plain disk, and coming back empty-handed costs the agent a whole tool call.
+const GREP_TIMEOUT: Duration = Duration::from_secs(30);
 const NON_ZERO_EXIT_CODE_ERROR: &str = "Grep command exited with non-zero exit code";
 
 /// Information about the Grep call that resulted in an error, used to send
@@ -334,11 +336,11 @@ impl GrepExecutor {
 /// Runs a grep-like search to find the files and line numbers that match the queries.
 ///
 /// Depending on the environment, this uses the most optimized tool to perform the search:
-/// - if the search is in a git repo, we run `git grep` in the session.
-///   `git grep` is the most optimized tool for searching in a git repo since it's already indexed.
-/// - otherwise, if the search is against the local file system, we run `ripgrep` via the library.
-///   `ripgrep` is a more optimized version of `grep`.
-/// - otherwise, we run vanilla `grep` in the session
+/// - a local session searches with `ripgrep` through the library: one in-process walk of the
+///   working tree, with no shell round trips to resolve the path or look for a repo, which is the
+///   difference that matters on a synced or networked checkout.
+/// - a remote session in a git repo runs `git grep`, since the tree is already indexed there.
+/// - otherwise, a remote session runs vanilla `grep`.
 async fn run_grep(
     queries: Vec<String>,
     absolute_path: String,
@@ -351,6 +353,11 @@ async fn run_grep(
     let Some(session) = session else {
         return Err(GrepError::new("No session provided to grep".to_string()));
     };
+
+    #[cfg(not(target_family = "wasm"))]
+    if session.is_local() {
+        return run_ripgrep(&queries, absolute_path).await;
+    }
 
     let is_file = is_file_path(&absolute_path, &session).await;
     let execute_directory = if is_file {
@@ -381,11 +388,8 @@ async fn run_grep(
         });
     let shell_type = session.shell().shell_type();
 
-    // The most optimized tool to perform the search is `git grep`;
-    // whether the session is local or remote, we can run `git grep` in the session.
-    // The next best way to search is ripgrep, but we can only run that if the session is local;
-    // ripgrep is run using the core lib, not as a command (not everyone will have it installed).
-    // And in the worst case, we run vanilla `grep` in the session. Although not optimal, this should always work.
+    // Remote sessions only from here: a search in a git repo runs `git grep`, which is already
+    // indexed there, and anything else runs the session's own `grep`.
     if is_grep_in_git_repo {
         run_git_grep_command(
             &queries,
@@ -396,31 +400,25 @@ async fn run_grep(
             &execute_directory,
         )
         .await
+    } else if shell_type == ShellType::PowerShell {
+        run_select_string_command(
+            &queries,
+            &absolute_path,
+            &session,
+            shell_launch_data,
+            &execute_directory,
+        )
+        .await
     } else {
-        #[cfg(not(target_family = "wasm"))]
-        if session.is_local() {
-            return run_ripgrep(&queries, absolute_path).await;
-        }
-        if shell_type == ShellType::PowerShell {
-            run_select_string_command(
-                &queries,
-                &absolute_path,
-                &session,
-                shell_launch_data,
-                &execute_directory,
-            )
-            .await
-        } else {
-            run_grep_command(
-                &queries,
-                &absolute_path,
-                &session,
-                shell_launch_data,
-                shell_type,
-                &execute_directory,
-            )
-            .await
-        }
+        run_grep_command(
+            &queries,
+            &absolute_path,
+            &session,
+            shell_launch_data,
+            shell_type,
+            &execute_directory,
+        )
+        .await
     }
 }
 

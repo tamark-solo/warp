@@ -74,6 +74,7 @@ use crate::ai::aws_credentials::refresh_aws_credentials;
 use crate::ai::blocklist::agent_view::agent_input_footer::editor::{
     AgentToolbarEditorMode, AgentToolbarInlineEditor,
 };
+use crate::ai::byo_inference::selectable_models;
 use crate::ai::execution_profiles::profiles::AIExecutionProfilesModel;
 #[cfg(not(target_family = "wasm"))]
 use crate::ai::geap_credentials::force_refresh_geap_credentials;
@@ -91,7 +92,8 @@ use crate::server::telemetry::{
 use crate::settings::{
     AIAutoDetectionEnabled, AICommandDenylist, AISettings, AISettingsChangedEvent,
     AgentModeQuerySuggestionsEnabled, AutoApproveBypassesCommandDenylist, AwsBedrockAutoLogin,
-    AwsBedrockCredentialsEnabled, CanUseWarpCreditsForFallback, EnableAiCommandSearchHashTrigger,
+    AwsBedrockCredentialsEnabled, ByoAutofillModel, ByoAutofillWait, ByoRankingMode,
+    CanUseWarpCreditsForFallback, EnableAiCommandSearchHashTrigger,
     GeminiEnterpriseCredentialsEnabled, GitOperationsAutogenEnabled, IncludeAgentCommandsInHistory,
     InputSettings, IntelligentAutosuggestionsEnabled, LongRunningCommandSubmissionMode,
     NLDInTerminalEnabled, NaturalLanguageAutosuggestionsEnabled, OrchestrationMessageDisplayMode,
@@ -641,6 +643,9 @@ pub struct WarpAgentPageView {
     self_handle: WeakViewHandle<Self>,
     voice_input_toggle_key_dropdown: ViewHandle<Dropdown<WarpAgentPageAction>>,
     voice_input_language_dropdown: ViewHandle<FilterableDropdown<WarpAgentPageAction>>,
+    byo_autofill_model_dropdown: ViewHandle<FilterableDropdown<WarpAgentPageAction>>,
+    byo_autofill_wait_dropdown: ViewHandle<Dropdown<WarpAgentPageAction>>,
+    byo_ranking_mode_dropdown: ViewHandle<Dropdown<WarpAgentPageAction>>,
     local_only_icon_tooltip_states: RefCell<HashMap<String, MouseStateHandle>>,
     autodetection_denylist_editor: ViewHandle<EditorView>,
     agent_toolbar_inline_editor: ViewHandle<AgentToolbarInlineEditor>,
@@ -760,6 +765,50 @@ impl WarpAgentPageView {
 
         let thinking_display_mode_dropdown =
             OtherAIWidget::create_thinking_display_mode_dropdown(ctx);
+
+        let byo_autofill_model_dropdown = ctx.add_typed_action_view(|ctx| {
+            let mut dropdown = FilterableDropdown::new(ctx);
+            dropdown.set_top_bar_max_width(AI_SETTINGS_DROPDOWN_WIDTH);
+            dropdown.set_menu_width(AI_SETTINGS_DROPDOWN_WIDTH, ctx);
+            dropdown
+        });
+
+        let byo_ranking_mode_dropdown = ctx.add_typed_action_view(|ctx| {
+            let mut dropdown = Dropdown::new(ctx);
+            dropdown.set_top_bar_max_width(AI_SETTINGS_DROPDOWN_WIDTH);
+            dropdown.set_menu_width(AI_SETTINGS_DROPDOWN_WIDTH, ctx);
+            dropdown.add_items(
+                ByoRankingMode::iter()
+                    .map(|mode| {
+                        DropdownItem::new(
+                            mode.display_name(),
+                            WarpAgentPageAction::SetByoRankingMode(mode),
+                        )
+                    })
+                    .collect(),
+                ctx,
+            );
+            dropdown
+        });
+
+        let byo_autofill_wait_dropdown = ctx.add_typed_action_view(|ctx| {
+            let mut dropdown = Dropdown::new(ctx);
+            dropdown.set_top_bar_max_width(AI_SETTINGS_DROPDOWN_WIDTH);
+            dropdown.set_menu_width(AI_SETTINGS_DROPDOWN_WIDTH, ctx);
+            dropdown.add_items(
+                ByoAutofillWait::iter()
+                    .map(|wait| {
+                        DropdownItem::new(
+                            wait.display_name(),
+                            WarpAgentPageAction::SetByoAutofillWait(wait),
+                        )
+                    })
+                    .collect(),
+                ctx,
+            );
+            dropdown
+        });
+
         // Set initial selection based on current setting value.
         {
             let current_mode = AISettings::as_ref(ctx).thinking_display_mode;
@@ -852,6 +901,7 @@ impl WarpAgentPageView {
         // Refresh model dropdowns when BYO API keys update so key icons reflect latest state.
         ctx.subscribe_to_model(&ApiKeyManager::handle(ctx), |me, _model, _event, ctx| {
             me.sync_custom_endpoint_buttons(ctx);
+            me.sync_byo_autofill_model_dropdown(ctx);
             // Driving the prompt off the key-store update (rather than the editor's
             // blur/Enter) means it fires reliably however the key was committed —
             // clicking outside the field, pressing Enter, or tabbing away.
@@ -951,6 +1001,15 @@ impl WarpAgentPageView {
                                 ctx,
                             );
                         });
+                }
+                AISettingsChangedEvent::ByoAutofillModel { .. } => {
+                    me.sync_byo_autofill_model_dropdown(ctx);
+                }
+                AISettingsChangedEvent::ByoAutofillWait { .. } => {
+                    me.sync_byo_autofill_wait_dropdown(ctx);
+                }
+                AISettingsChangedEvent::ByoRankingMode { .. } => {
+                    me.sync_byo_ranking_mode_dropdown(ctx);
                 }
                 _ => (),
             }
@@ -1160,11 +1219,14 @@ impl WarpAgentPageView {
             },
         );
 
-        Self {
+        let mut me = Self {
             page: Self::build_page(ctx),
             self_handle,
             voice_input_toggle_key_dropdown,
             voice_input_language_dropdown,
+            byo_autofill_model_dropdown,
+            byo_autofill_wait_dropdown,
+            byo_ranking_mode_dropdown,
             autodetection_denylist_editor,
             local_only_icon_tooltip_states: Default::default(),
             agent_toolbar_inline_editor,
@@ -1189,7 +1251,64 @@ impl WarpAgentPageView {
             grok_oauth_attempt: None,
             #[cfg(not(target_family = "wasm"))]
             grok_code_editor,
-        }
+        };
+        me.sync_byo_autofill_model_dropdown(ctx);
+        me.sync_byo_autofill_wait_dropdown(ctx);
+        me.sync_byo_ranking_mode_dropdown(ctx);
+        me
+    }
+
+    /// Rebuilds the autofill model choices from the current custom endpoints and the stored
+    /// selection, so the row tracks endpoints added or removed while the page is open.
+    fn sync_byo_autofill_model_dropdown(&mut self, ctx: &mut ViewContext<Self>) {
+        let scope = UserWorkspaces::as_ref(ctx).team_context(&self.self_handle, ctx);
+        let models = selectable_models(ctx, &scope);
+        let selected = AISettings::as_ref(ctx).byo_autofill_model.value().clone();
+        let selection_present = selected
+            .as_deref()
+            .is_some_and(|config_key| models.iter().any(|choice| choice.config_key == config_key));
+
+        let items: Vec<DropdownItem<WarpAgentPageAction>> = std::iter::once(DropdownItem::new(
+            "First model (default)",
+            WarpAgentPageAction::SetByoAutofillModel(None),
+        ))
+        .chain(models.into_iter().map(|choice| {
+            DropdownItem::new(
+                format!("{} · {}", choice.endpoint_name, choice.model_label),
+                WarpAgentPageAction::SetByoAutofillModel(Some(choice.config_key)),
+            )
+        }))
+        .collect();
+
+        self.byo_autofill_model_dropdown
+            .update(ctx, |dropdown, ctx| {
+                dropdown.set_items(items, ctx);
+                if selection_present {
+                    dropdown.set_selected_by_action(
+                        WarpAgentPageAction::SetByoAutofillModel(selected),
+                        ctx,
+                    );
+                } else {
+                    dropdown.set_selected_by_index(0, ctx);
+                }
+            });
+    }
+
+    /// Points the autofill wait row at the stored setting.
+    fn sync_byo_autofill_wait_dropdown(&mut self, ctx: &mut ViewContext<Self>) {
+        let wait = AISettings::as_ref(ctx).byo_autofill_wait;
+        self.byo_autofill_wait_dropdown
+            .update(ctx, |dropdown, ctx| {
+                dropdown.set_selected_by_action(WarpAgentPageAction::SetByoAutofillWait(wait), ctx);
+            });
+    }
+
+    /// Points the ranking mode row at the stored setting.
+    fn sync_byo_ranking_mode_dropdown(&mut self, ctx: &mut ViewContext<Self>) {
+        let mode = AISettings::as_ref(ctx).byo_ranking_mode;
+        self.byo_ranking_mode_dropdown.update(ctx, |dropdown, ctx| {
+            dropdown.set_selected_by_action(WarpAgentPageAction::SetByoRankingMode(mode), ctx);
+        });
     }
 
     fn update_voice_input_dropdown_enablement(&mut self, ctx: &mut ViewContext<Self>) {
@@ -2154,7 +2273,12 @@ impl WarpAgentPageView {
                     }
                 },
             ),
-            vec![Box::new(ApiKeysWidget::new(ctx))],
+            vec![
+                Box::new(ApiKeysWidget::new(ctx)),
+                Box::new(ByoAutofillModelWidget::new(ctx)),
+                Box::new(ByoAutofillWaitWidget::new(ctx)),
+                Box::new(ByoRankingModeWidget::new(ctx)),
+            ],
         ));
 
         categories.push(Category::new(
@@ -2322,6 +2446,13 @@ pub enum WarpAgentPageAction {
     OpenUrl(String),
     SetVoiceInputToggleKey(VoiceInputToggleKey),
     SetVoiceInputLanguage(String),
+    /// Selects the custom-endpoint model (by `config_key`) that answers terminal autofill;
+    /// `None` means the first model of the first usable endpoint.
+    SetByoAutofillModel(Option<String>),
+    /// How long terminal autofill waits on that model.
+    SetByoAutofillWait(ByoAutofillWait),
+    /// How long codebase search waits on that model before answering from the local outline.
+    SetByoRankingMode(ByoRankingMode),
     ToggleGlobalAI,
     ToggleActiveAI,
     ToggleIntelligentAutosuggestions,
@@ -2398,6 +2529,25 @@ impl TypedActionView for WarpAgentPageView {
                 let language = language.clone();
                 AISettings::handle(ctx).update(ctx, |settings, ctx| {
                     report_if_error!(settings.voice_input_language.set_value(language, ctx));
+                });
+                ctx.notify();
+            }
+            WarpAgentPageAction::SetByoAutofillModel(config_key) => {
+                let config_key = config_key.clone();
+                AISettings::handle(ctx).update(ctx, |settings, ctx| {
+                    report_if_error!(settings.byo_autofill_model.set_value(config_key, ctx));
+                });
+                ctx.notify();
+            }
+            WarpAgentPageAction::SetByoAutofillWait(wait) => {
+                AISettings::handle(ctx).update(ctx, |settings, ctx| {
+                    report_if_error!(settings.byo_autofill_wait.set_value(*wait, ctx));
+                });
+                ctx.notify();
+            }
+            WarpAgentPageAction::SetByoRankingMode(mode) => {
+                AISettings::handle(ctx).update(ctx, |settings, ctx| {
+                    report_if_error!(settings.byo_ranking_mode.set_value(*mode, ctx));
                 });
                 ctx.notify();
             }
@@ -5510,6 +5660,167 @@ impl CustomInferenceVisibility {
     /// Whether any member-facing Custom Inference content renders at all.
     fn show_section(&self) -> bool {
         self.show_provider_keys || self.show_custom_inference
+    }
+}
+
+/// Whether the custom-endpoint model rows are worth showing: the feature is on, the
+/// custom-inference controls are enabled, and there is at least one model to point them at.
+fn byo_model_rows_available(
+    view_handle: &WeakViewHandle<WarpAgentPageView>,
+    app: &AppContext,
+) -> bool {
+    if !FeatureFlag::LocalByoInference.is_enabled() {
+        return false;
+    }
+    let scope = UserWorkspaces::as_ref(app).team_context(view_handle, app);
+    CustomInferenceVisibility::compute(&scope, app).custom_inference_controls_enabled
+        && !selectable_models(app, &scope).is_empty()
+}
+
+/// Picks which custom-endpoint model answers terminal autofill.
+struct ByoAutofillModelWidget {
+    view_handle: WeakViewHandle<WarpAgentPageView>,
+}
+
+impl ByoAutofillModelWidget {
+    fn new(ctx: &ViewContext<WarpAgentPageView>) -> Self {
+        Self {
+            view_handle: ctx.handle(),
+        }
+    }
+}
+
+impl SettingsWidget for ByoAutofillModelWidget {
+    type View = WarpAgentPageView;
+
+    fn search_terms(&self) -> &str {
+        "autofill next command suggestion custom endpoint model byo inference"
+    }
+
+    fn should_render(&self, app: &AppContext) -> bool {
+        byo_model_rows_available(&self.view_handle, app)
+    }
+
+    fn render(
+        &self,
+        view: &Self::View,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        render_filterable_dropdown_item(
+            appearance,
+            "Autofill and search model",
+            Some(
+                "Which custom endpoint model predicts your next command and ranks codebase search results.",
+            ),
+            None,
+            LocalOnlyIconState::for_setting(
+                ByoAutofillModel::storage_key(),
+                ByoAutofillModel::sync_to_cloud(),
+                &mut view.local_only_icon_tooltip_states.borrow_mut(),
+                app,
+            ),
+            None,
+            &view.byo_autofill_model_dropdown,
+        )
+    }
+}
+
+/// Picks how long terminal autofill waits on that model, if at all.
+struct ByoAutofillWaitWidget {
+    view_handle: WeakViewHandle<WarpAgentPageView>,
+}
+
+impl ByoAutofillWaitWidget {
+    fn new(ctx: &ViewContext<WarpAgentPageView>) -> Self {
+        Self {
+            view_handle: ctx.handle(),
+        }
+    }
+}
+
+impl SettingsWidget for ByoAutofillWaitWidget {
+    type View = WarpAgentPageView;
+
+    fn search_terms(&self) -> &str {
+        "autofill next command suggestion wait timeout custom endpoint byo inference"
+    }
+
+    fn should_render(&self, app: &AppContext) -> bool {
+        byo_model_rows_available(&self.view_handle, app)
+    }
+
+    fn render(
+        &self,
+        view: &Self::View,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        render_dropdown_item(
+            appearance,
+            "Terminal autofill",
+            Some(
+                "How long a next-command suggestion waits on your endpoint. Off leaves the endpoint out of autofill.",
+            ),
+            None,
+            LocalOnlyIconState::for_setting(
+                ByoAutofillWait::storage_key(),
+                ByoAutofillWait::sync_to_cloud(),
+                &mut view.local_only_icon_tooltip_states.borrow_mut(),
+                app,
+            ),
+            None,
+            &view.byo_autofill_wait_dropdown,
+        )
+    }
+}
+
+/// Picks how long codebase search waits on that model before answering from the local outline.
+struct ByoRankingModeWidget {
+    view_handle: WeakViewHandle<WarpAgentPageView>,
+}
+
+impl ByoRankingModeWidget {
+    fn new(ctx: &ViewContext<WarpAgentPageView>) -> Self {
+        Self {
+            view_handle: ctx.handle(),
+        }
+    }
+}
+
+impl SettingsWidget for ByoRankingModeWidget {
+    type View = WarpAgentPageView;
+
+    fn search_terms(&self) -> &str {
+        "codebase search ranking patience latency local fallback custom endpoint byo inference"
+    }
+
+    fn should_render(&self, app: &AppContext) -> bool {
+        byo_model_rows_available(&self.view_handle, app)
+    }
+
+    fn render(
+        &self,
+        view: &Self::View,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        render_dropdown_item(
+            appearance,
+            "Codebase search ranking",
+            Some(
+                "Your endpoint ranks agent search results; on failures it falls back to local sorting.",
+            ),
+            None,
+            LocalOnlyIconState::for_setting(
+                ByoRankingMode::storage_key(),
+                ByoRankingMode::sync_to_cloud(),
+                &mut view.local_only_icon_tooltip_states.borrow_mut(),
+                app,
+            ),
+            None,
+            &view.byo_ranking_mode_dropdown,
+        )
     }
 }
 

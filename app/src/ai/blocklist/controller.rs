@@ -62,6 +62,7 @@ use crate::ai::ambient_agents::AmbientAgentTaskId;
 use crate::ai::document::ai_document_model::{
     AIDocumentId, AIDocumentModel, AIDocumentUserEditStatus,
 };
+use crate::ai::get_relevant_files::auto_context;
 use crate::ai::llms::{LLMId, LLMPreferences};
 use crate::ai::skills::{ActiveSkillLookupError, SkillManager};
 use crate::cloud_object::model::persistence::CloudModel;
@@ -762,12 +763,25 @@ impl BlocklistAIController {
             action_model.drain_finished_action_results(conversation_id)
         });
 
+        // Locally-retrieved files ride along with user submissions only: follow-ups that carry
+        // action results do not need them, and the agent can always search on its own.
+        let auto_context = match input_query.input_query {
+            InputQueryType::UserSubmittedQueryFromInput { .. } => auto_context::context_for_query(
+                &query,
+                self.active_session
+                    .as_ref(ctx)
+                    .current_working_directory()
+                    .map(String::as_str),
+                ctx,
+            ),
+            _ => Vec::new(),
+        };
         let context = input_context_for_request(
             false,
             self.context_model.as_ref(ctx),
             self.active_session.as_ref(ctx),
             Some(conversation_id),
-            vec![],
+            auto_context,
             ctx,
         );
         let mut inputs = if should_prepend_finished_action_results {

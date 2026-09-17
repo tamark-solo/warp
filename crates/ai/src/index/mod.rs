@@ -5,9 +5,9 @@ pub const DEFAULT_SYNC_REQUESTS_PER_MIN: u32 = 600;
 #[allow(dead_code)]
 pub mod full_source_code_embedding;
 
+pub use file_outline::{FileSymbols, Outline, Symbol};
 #[cfg(feature = "local_fs")]
-pub use file_outline::build_outline;
-pub use file_outline::{Outline, Symbol};
+pub use file_outline::{build_outline, build_outline_tree};
 pub use repo_metadata::{BuildTreeError, DirectoryEntry, Entry, FileId, FileMetadata};
 
 cfg_if::cfg_if! {

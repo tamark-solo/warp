@@ -26,6 +26,9 @@ pub enum RepoDetectionSource {
     CodeReviewInitialization,
     /// Repo was cloned or discovered during cloud agent environment preparation.
     CloudEnvironmentPrep,
+    /// Repo was detected for a working directory a previous session was last seen in, so a
+    /// restart picks up where the last one left off.
+    RestoredRepository,
 }
 
 pub enum DetectedRepositoriesEvent {

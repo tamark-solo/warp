@@ -18,10 +18,13 @@ use warpui::{AppContext, Entity, ModelContext, ModelHandle, SingletonEntity};
 use crate::ai::agent::SearchCodebaseFailureReason;
 use crate::ai::agent::{AIAgentActionId, SearchCodebaseResult};
 use crate::ai::blocklist::SessionContext;
+use crate::ai::byo_inference;
 use crate::ai::get_relevant_files::api::{FileContext as FileContextRequest, GetRelevantFiles};
+use crate::ai::get_relevant_files::local_search::RankingPolicy;
 use crate::ai::outline::{OutlineStatus, RepoOutlines};
 use crate::server::server_api::{AIApiError, ServerApiProvider};
 use crate::server::team_scope::RequestTeamScope;
+use crate::settings::AISettings;
 use crate::{TelemetryEvent, send_telemetry_from_ctx};
 #[cfg_attr(not(target_family = "wasm"), path = "remote_search/native.rs")]
 #[cfg_attr(target_family = "wasm", path = "remote_search/wasm.rs")]
@@ -248,6 +251,76 @@ impl GetRelevantFilesController {
         ctx: &mut ModelContext<Self>,
     ) -> Result<(), GetRelevantFilesError> {
         const MINIMUM_FILE_COUNT_FOR_API_CALL: usize = 2;
+
+        // Local BYO retrieval: rank the locally-built outline with the user's own endpoint, so
+        // SearchCodebase works without Warp credits or a server-built index.
+        #[cfg(not(target_family = "wasm"))]
+        if FeatureFlag::LocalByoInference.is_enabled()
+            && let Some(endpoint) = byo_inference::resolve_for_team_uid(ctx, team_scope.team_uid())
+            && let Some((OutlineStatus::Complete(outline), base_path)) =
+                RepoOutlines::as_ref(ctx).get_outline(directory)
+        {
+            // Path segments only boost candidates in `local_search`; hard-filtering the outline by
+            // them would drop every result when the model passes a segment that matches no path.
+            let file_symbols = outline.to_file_symbols(None);
+            let file_paths: Vec<PathBuf> = file_symbols
+                .iter()
+                .map(|file| base_path.join(&file.path))
+                .collect();
+
+            if file_paths.len() < MINIMUM_FILE_COUNT_FOR_API_CALL {
+                ctx.emit(GetRelevantFilesControllerEvent::Success {
+                    action_id,
+                    result: GetRelevantFilesControllerResult::Locations(Arc::new(
+                        file_paths
+                            .into_iter()
+                            .map(CodeContextLocation::WholeFile)
+                            .collect(),
+                    )),
+                });
+                return Ok(());
+            }
+
+            let action_id_clone = action_id.clone();
+            let partial_path_segments = partial_path_segments.cloned();
+            let policy = RankingPolicy::for_mode(AISettings::as_ref(ctx).byo_ranking_mode);
+            let request_abort_handle = ctx
+                .spawn(
+                    async move {
+                        let ranked = super::local_search::rank(
+                            &endpoint,
+                            policy,
+                            &query,
+                            partial_path_segments.as_deref(),
+                            &file_symbols,
+                        )
+                        .await;
+                        let locations: Arc<HashSet<CodeContextLocation>> = Arc::new(
+                            ranked
+                                .into_iter()
+                                .map(|path| CodeContextLocation::WholeFile(base_path.join(path)))
+                                .collect(),
+                        );
+                        Ok::<_, anyhow::Error>(locations)
+                    },
+                    move |me,
+                          relevant_file_paths: Result<
+                        Arc<HashSet<CodeContextLocation>>,
+                        anyhow::Error,
+                    >,
+                          ctx| {
+                        me.handle_relevant_file_paths_result(
+                            relevant_file_paths,
+                            action_id_clone,
+                            ctx,
+                        )
+                    },
+                )
+                .abort_handle();
+            self.pending_requests
+                .insert(action_id, RequestHandle::AbortHandle(request_abort_handle));
+            return Ok(());
+        }
 
         if FeatureFlag::FullSourceCodeEmbedding.is_enabled() {
             let codebase_mgr = CodebaseIndexManager::handle(ctx);

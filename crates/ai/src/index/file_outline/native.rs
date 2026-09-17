@@ -25,12 +25,28 @@ cfg_if::cfg_if! {
     }
 }
 
-/// Given a repo path, try to build its outline. An outline is a list of all its files and the symbols
-/// of interest from each file.
-pub async fn build_outline(
+/// Walks a repo into an outline that carries its files but no symbols.
+///
+/// Parsing symbols dominates the cost of [`build_outline`], so a caller that wants something
+/// usable early can publish this first and replace it once parsing finishes.
+pub async fn build_outline_tree(
     path: &Path,
     max_num_files_limit: Option<usize>,
 ) -> anyhow::Result<Outline> {
+    let (entry, _files, gitignores) = walk_repo(path, max_num_files_limit).await?;
+    Ok(Outline {
+        root: entry,
+        file_id_to_outline: HashMap::new(),
+        gitignores,
+    })
+}
+
+/// Traverses a repo path, returning its tree, the files worth parsing, and the gitignore patterns
+/// in effect.
+async fn walk_repo(
+    path: &Path,
+    max_num_files_limit: Option<usize>,
+) -> anyhow::Result<(Entry, Vec<FileMetadata>, Vec<Arc<Gitignore>>)> {
     const MAX_DEPTH: usize = 200;
     let mut gitignores = vec![];
 
@@ -46,7 +62,6 @@ pub async fn build_outline(
         gitignores.push(Arc::new(gitignore));
     }
 
-    // First traverse the repo path to retrieve all files we want to parse.
     let mut files = Vec::new();
     let mut remaining_file_quotas = max_num_files_limit;
     let entry = Entry::build_tree(
@@ -60,6 +75,17 @@ pub async fn build_outline(
         BudgetExceededBehavior::StopAndLazyLoad,
     )
     .await?;
+
+    Ok((entry, files, gitignores))
+}
+
+/// Given a repo path, try to build its outline. An outline is a list of all its files and the symbols
+/// of interest from each file.
+pub async fn build_outline(
+    path: &Path,
+    max_num_files_limit: Option<usize>,
+) -> anyhow::Result<Outline> {
+    let (entry, files, gitignores) = walk_repo(path, max_num_files_limit).await?;
 
     let (sender, receiver) = oneshot::channel();
 

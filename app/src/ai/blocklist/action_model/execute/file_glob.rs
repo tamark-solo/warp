@@ -24,7 +24,9 @@ use crate::terminal::shell::ShellType;
 use crate::workspaces::user_workspaces::TeamContext;
 use crate::{TelemetryEvent, send_telemetry_from_app_ctx};
 
-const FILE_GLOB_TIMEOUT: Duration = Duration::from_secs(10);
+/// Same budget as grep: walking a checkout on a synced or networked filesystem is the slow case,
+/// and a timeout here costs the agent the tool call.
+const FILE_GLOB_TIMEOUT: Duration = Duration::from_secs(30);
 
 use warp_errors::report_error;
 

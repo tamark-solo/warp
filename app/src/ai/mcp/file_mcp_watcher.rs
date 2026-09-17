@@ -694,19 +694,23 @@ fn should_watch_repository(
     source: RepoDetectionSource,
     settings_mode: settings::SettingsMode,
 ) -> bool {
+    // A repo restored at startup has not been navigated to in this session, so it starts no
+    // servers until a terminal lands in it.
     match settings_mode {
         settings::SettingsMode::Gui => match source {
             RepoDetectionSource::TerminalNavigation | RepoDetectionSource::CloudEnvironmentPrep => {
                 true
             }
             RepoDetectionSource::ProjectRulesIndexing
-            | RepoDetectionSource::CodeReviewInitialization => false,
+            | RepoDetectionSource::CodeReviewInitialization
+            | RepoDetectionSource::RestoredRepository => false,
         },
         settings::SettingsMode::Tui => match source {
             RepoDetectionSource::TerminalNavigation => true,
             RepoDetectionSource::ProjectRulesIndexing
             | RepoDetectionSource::CodeReviewInitialization
-            | RepoDetectionSource::CloudEnvironmentPrep => false,
+            | RepoDetectionSource::CloudEnvironmentPrep
+            | RepoDetectionSource::RestoredRepository => false,
         },
     }
 }

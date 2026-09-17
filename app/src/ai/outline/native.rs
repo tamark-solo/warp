@@ -2,12 +2,14 @@ use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use ai::index::build_outline;
+use ai::index::{build_outline, build_outline_tree};
 use anyhow::Context as _;
 use async_channel::Sender;
 use futures::stream::AbortHandle;
 use instant::Instant;
-use repo_metadata::repositories::{DetectedRepositories, DetectedRepositoriesEvent};
+use repo_metadata::repositories::{
+    DetectedRepositories, DetectedRepositoriesEvent, RepoDetectionSource,
+};
 use repo_metadata::repository::{
     BufferingRepositorySubscriber, RepositorySubscriber, SubscriberId,
 };
@@ -15,7 +17,8 @@ use repo_metadata::{
     CanonicalizedPath, DirectoryWatcher, Repository, RepositoryUpdate, RepositoryWatchMode,
 };
 use settings::Setting as _;
-use warp_errors::report_error;
+use warp_core::features::FeatureFlag;
+use warp_errors::{report_error, report_if_error};
 use warpui::{Entity, ModelContext, ModelHandle, SingletonEntity};
 
 use super::OutlineStatus;
@@ -24,6 +27,7 @@ use crate::settings::{
     AISettings, AISettingsChangedEvent, CodeSettings, CodeSettingsChangedEvent, InputSettings,
     InputSettingsChangedEvent,
 };
+use crate::util::repo_detection::{RepoDetectionSessionType, detect_possible_git_repo};
 use crate::workspaces::user_workspaces::UserWorkspaces;
 use crate::{TelemetryEvent, safe_info, safe_warn, send_telemetry_from_ctx};
 
@@ -88,8 +92,10 @@ impl RepoOutlines {
                     repository,
                     source: _,
                 } = event;
+                Self::remember_repo(repository, ctx);
                 me.index_repo(repository.clone(), ctx);
             });
+            Self::restore_remembered_repo(ctx);
         }
 
         ctx.subscribe_to_model(&InputSettings::handle(ctx), |me, _, event, ctx| {
@@ -116,6 +122,39 @@ impl RepoOutlines {
             active_outline_task: Default::default(),
             indexing_enabled: true,
         }
+    }
+
+    /// Records the repo a session is working in, so the next launch can restore detection without
+    /// a terminal having to land in it first.
+    fn remember_repo(repository: &ModelHandle<Repository>, ctx: &mut ModelContext<Self>) {
+        let repo_path = repository.as_ref(ctx).root_dir().to_local_path_lossy();
+        let repo_path = repo_path.to_string_lossy().to_string();
+        if AISettings::as_ref(ctx).remembered_repo.value().as_deref() == Some(repo_path.as_str()) {
+            return;
+        }
+        AISettings::handle(ctx).update(ctx, |settings, ctx| {
+            report_if_error!(settings.remembered_repo.set_value(Some(repo_path), ctx));
+        });
+    }
+
+    /// Re-runs detection for the repo the last session worked in. Detection itself decides whether
+    /// the path still holds a repo, so a checkout that moved or was deleted restores nothing.
+    fn restore_remembered_repo(ctx: &mut ModelContext<Self>) {
+        if !FeatureFlag::LocalByoInference.is_enabled() {
+            return;
+        }
+        let Some(repo_path) = AISettings::as_ref(ctx).remembered_repo.value().clone() else {
+            return;
+        };
+        log::info!("Restoring repository from the last session: {repo_path}");
+        // Detection runs on a task spawned inside `DetectedRepositories`, and this call site only
+        // wants the `DetectedGitRepo` event it emits.
+        drop(detect_possible_git_repo(
+            RepoDetectionSessionType::Local,
+            &repo_path,
+            RepoDetectionSource::RestoredRepository,
+            ctx,
+        ));
     }
 
     fn index_repo(&mut self, repository: ModelHandle<Repository>, ctx: &mut ModelContext<Self>) {
@@ -214,6 +253,40 @@ impl RepoOutlines {
     /// `repo_root` is assumed to be the root of a code repository.
     fn compute_outline_for_repo(&mut self, repo_root: PathBuf, ctx: &mut ModelContext<Self>) {
         let root_path_clone = repo_root.clone();
+
+        // Publish a path-only outline as soon as the repo walk finishes. Symbol parsing dominates
+        // the full build, and local retrieval can already rank files by path in the meantime.
+        if FeatureFlag::LocalByoInference.is_enabled() {
+            let tree_root = repo_root.clone();
+            ctx.spawn(
+                async move {
+                    let canonicalized_path = CanonicalizedPath::try_from(&tree_root)?;
+                    build_outline_tree(canonicalized_path.as_path(), Some(MAX_REPO_FILE_SIZE_LIMIT))
+                        .await
+                        .map(|outline| (canonicalized_path, outline))
+                },
+                move |me, res, ctx| {
+                    if !me.should_build_outlines(ctx) {
+                        return;
+                    }
+                    let Ok((canonicalized_path, outline)) = res else {
+                        return;
+                    };
+                    let path = canonicalized_path.as_path_buf().clone();
+                    // Never clobber an outline whose symbols have already been parsed.
+                    if let Some(state) = me.outlines.get_mut(&path)
+                        && !matches!(state.status, OutlineStatus::Complete(_))
+                    {
+                        state.status = OutlineStatus::Complete(outline);
+                        safe_info!(
+                            safe: ("Published path-only repo outline."),
+                            full: ("Published path-only repo outline for {}", path.display())
+                        );
+                        ctx.emit(RepoOutlinesEvent::OutlinesUpdated(path));
+                    }
+                },
+            );
+        }
 
         let scan_start = Instant::now();
         let scan_abort_handle = ctx

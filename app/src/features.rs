@@ -531,6 +531,8 @@ fn enabled_features() -> HashSet<FeatureFlag> {
         FeatureFlag::HistorySearchRankingV2,
         #[cfg(feature = "stored_screenshots")]
         FeatureFlag::StoredScreenshots,
+        // Fork-local: no cargo feature gates this one, it is on for every build of this tree.
+        FeatureFlag::LocalByoInference,
     ]);
 
     flags

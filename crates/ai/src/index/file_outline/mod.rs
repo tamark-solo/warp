@@ -3,7 +3,7 @@
 cfg_if::cfg_if! {
     if #[cfg(not(target_arch = "wasm32"))] {
         mod native;
-        pub use native::build_outline;
+        pub use native::{build_outline, build_outline_tree};
     }
 }
 

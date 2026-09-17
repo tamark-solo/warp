@@ -1209,6 +1209,109 @@ impl settings_value::SettingsValue for ToolbarCommandMap {
     }
 }
 
+/// How long a terminal autofill call may wait on the custom endpoint, if it is used at all.
+#[derive(
+    Default,
+    Debug,
+    serde::Serialize,
+    serde::Deserialize,
+    PartialEq,
+    Copy,
+    Clone,
+    EnumIter,
+    schemars::JsonSchema,
+    settings_value::SettingsValue,
+)]
+#[schemars(
+    description = "How long terminal autofill waits on the custom endpoint before giving up.",
+    rename_all = "snake_case"
+)]
+pub enum ByoAutofillWait {
+    /// Leave the endpoint out of autofill entirely.
+    Off,
+    /// Give a suggestion a normal window to arrive (default).
+    #[default]
+    TenSeconds,
+    /// Wait longer, for endpoints that answer slowly but well.
+    TwentySeconds,
+}
+
+settings::macros::implement_setting_for_enum!(
+    ByoAutofillWait,
+    AISettings,
+    SupportedPlatforms::ALL,
+    SyncToCloud::Never,
+    surface: settings::SettingSurfaces::ALL,
+    private: false,
+    toml_path: "agents.byo_autofill_wait",
+    description: "How long terminal autofill waits on the custom endpoint before giving up.",
+);
+
+impl ByoAutofillWait {
+    /// Display name for the settings dropdown.
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            ByoAutofillWait::Off => "Off",
+            ByoAutofillWait::TenSeconds => "Up to 10s (default)",
+            ByoAutofillWait::TwentySeconds => "Up to 20s",
+        }
+    }
+}
+
+/// How much patience codebase search spends on the custom endpoint before it answers from the
+/// locally-built outline alone.
+#[derive(
+    Default,
+    Debug,
+    serde::Serialize,
+    serde::Deserialize,
+    PartialEq,
+    Copy,
+    Clone,
+    EnumIter,
+    schemars::JsonSchema,
+    settings_value::SettingsValue,
+)]
+#[schemars(
+    description = "How long codebase search waits on the custom endpoint before falling back to \
+                   local ranking.",
+    rename_all = "snake_case"
+)]
+pub enum ByoRankingMode {
+    /// Never ask the endpoint to rank: search returns the local order immediately.
+    LexicalOnly,
+    /// Give the endpoint a moderate window per search, and stop asking for a while once it fails
+    /// repeatedly (default).
+    #[default]
+    Balanced,
+    /// Give the endpoint a long window per search, for endpoints that answer slowly but well.
+    Patient,
+}
+
+settings::macros::implement_setting_for_enum!(
+    ByoRankingMode,
+    AISettings,
+    SupportedPlatforms::ALL,
+    SyncToCloud::Never,
+    surface: settings::SettingSurfaces::ALL,
+    private: false,
+    toml_path: "agents.byo_ranking_mode",
+    description: "How long codebase search waits on the custom endpoint before falling back to \
+                  local ranking.",
+);
+
+impl ByoRankingMode {
+    /// Display name for the settings dropdown. The wait is spelled out so the row says what
+    /// changes without a trip to the docs.
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            ByoRankingMode::LexicalOnly => "Local only (instant)",
+            ByoRankingMode::Balanced => "Up to 20s (default)",
+            ByoRankingMode::Patient => "Up to 60s",
+        }
+    }
+}
+
 define_settings_group!(AISettings, settings: [
     // If `false`, all AI features are disabled.
     is_any_ai_enabled: IsAnyAIEnabled {
@@ -1526,6 +1629,38 @@ define_settings_group!(AISettings, settings: [
         max_table_depth: 2,
         description: "Custom inference endpoint definitions.",
     }
+
+    // Which custom-endpoint model serves local inference when `FeatureFlag::LocalByoInference`
+    // routes it to the user's own endpoint: terminal autofill and codebase search ranking.
+    // Stores the model's `config_key`; unset means the first model of the first usable endpoint.
+    byo_autofill_model: ByoAutofillModel {
+        type: Option<String>,
+        default: None,
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Never,
+        surface: settings::SettingSurfaces::ALL,
+        private: false,
+        toml_path: "agents.byo_autofill_model",
+        description: "Custom endpoint model used for local autofill and codebase search.",
+    }
+    // How long terminal autofill may wait on that model, or `off` to keep the model out of it.
+    byo_autofill_wait: ByoAutofillWait,
+    // Repo root a previous session was last seen working in. Nothing re-runs repo detection at
+    // startup, so without this a restart loses the outline and repo metadata until a terminal
+    // lands in the checkout again.
+    remembered_repo: RememberedRepo {
+        type: Option<String>,
+        default: None,
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Never,
+        surface: settings::SettingSurfaces::ALL,
+        private: false,
+        toml_path: "agents.remembered_repo",
+        description: "Repository restored at startup from the last session that worked in one.",
+    }
+    // How much patience codebase search spends on that model before it answers from the locally
+    // built outline alone.
+    byo_ranking_mode: ByoRankingMode,
     // Which unit the TUI footer's usage entry displays (credits or provider
     // cost), flipped by clicking the entry.
     //
